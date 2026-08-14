@@ -1,0 +1,289 @@
+package httpapi
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"yyb_go/internal/store"
+)
+
+const cookieName = "yyb_go_session"
+
+// 通过环境变量配置，空值表示未设置
+var (
+	adminUser = os.Getenv("YYB_ADMIN_USER")
+	adminPass = os.Getenv("YYB_ADMIN_PASS")
+	ApiToken  = os.Getenv("YYB_API_TOKEN")
+)
+
+type sessionEntry struct {
+	user      string
+	expiresAt time.Time
+}
+
+var (
+	sessions   = map[string]sessionEntry{}
+	sessionsMu sync.Mutex
+)
+// ---- 多 Token 校验（基于 SQLite + 内存哈希缓存，避免每次请求查库）----
+
+// activeTokenHashes 保存当前「启用中」Token 的 secret 哈希，鉴权时直接查此集合。
+var (
+	tokenCacheMu      sync.RWMutex
+	activeTokenHashes = map[string]struct{}{}
+)
+
+// hashTokenSecret 对 Token 原文计算 SHA-256 十六进制；数据库只存哈希。
+func hashTokenSecret(raw string) string {
+	h := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(h[:])
+}
+
+// generateTokenSecret 生成 32 字节随机 hex（64 字符）的强 Token。
+func generateTokenSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// loadTokenHashes 启动时把数据库中所有「启用中」Token 的哈希载入缓存。
+func loadTokenHashes(db *store.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	toks, err := db.ListAPITokens(ctx)
+	if err != nil {
+		return
+	}
+	m := make(map[string]struct{}, len(toks))
+	for _, t := range toks {
+		if t.Enabled {
+			m[t.SecretHash] = struct{}{}
+		}
+	}
+	tokenCacheMu.Lock()
+	activeTokenHashes = m
+	tokenCacheMu.Unlock()
+}
+
+func isActiveTokenHash(h string) bool {
+	tokenCacheMu.RLock()
+	defer tokenCacheMu.RUnlock()
+	_, ok := activeTokenHashes[h]
+	return ok
+}
+
+func tokenCacheAdd(h string) {
+	tokenCacheMu.Lock()
+	activeTokenHashes[h] = struct{}{}
+	tokenCacheMu.Unlock()
+}
+
+func tokenCacheRemove(h string) {
+	tokenCacheMu.Lock()
+	delete(activeTokenHashes, h)
+	tokenCacheMu.Unlock()
+}
+
+func tokenCacheSetEnabled(h string, enabled bool) {
+	tokenCacheMu.Lock()
+	if enabled {
+		activeTokenHashes[h] = struct{}{}
+	} else {
+		delete(activeTokenHashes, h)
+	}
+	tokenCacheMu.Unlock()
+}
+
+
+func sessionCleanupLoop() {
+	for range time.NewTicker(5 * time.Minute).C {
+		sessionsMu.Lock()
+		now := time.Now()
+		for k, s := range sessions {
+			if now.After(s.expiresAt) {
+				delete(sessions, k)
+			}
+		}
+		sessionsMu.Unlock()
+	}
+}
+
+func hexEncode(b []byte) string {
+	const hex = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = hex[v>>4]
+		out[i*2+1] = hex[v&0x0f]
+	}
+	return string(out)
+}
+
+func generateSessionID() string {
+	b := make([]byte, 32)
+	_, _ = io.ReadFull(rand.Reader, b)
+	return hexEncode(b)
+}
+
+func requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	// Paths that don't need auth
+	if r.URL.Path == "/login" || r.URL.Path == "/logout" || r.URL.Path == "/health" {
+		return true
+	}
+
+	// 公开入口：无需登录即可访问（API 文档、扫码添加与业务 API）
+	// 放开 /qr 前缀是让 /scan 页面的二维码生成/轮询/确认流程能在未登录时工作。
+	// /api/tokens* 为令牌管理，保持鉴权，不在此放行。
+	if r.URL.Path == "/scan" || r.URL.Path == "/openapi.json" ||
+		strings.HasPrefix(r.URL.Path, "/docs") ||
+		strings.HasPrefix(r.URL.Path, "/qr") ||
+		strings.HasPrefix(r.URL.Path, "/wxapp") ||
+		strings.HasPrefix(r.URL.Path, "/accounts") ||
+		(strings.HasPrefix(r.URL.Path, "/api") && !strings.HasPrefix(r.URL.Path, "/api/tokens")) {
+		return true
+	}
+
+	// Check Bearer token for API calls（多 Token：校验哈希是否命中启用中的集合）
+	auth := r.Header.Get("Authorization")
+	if len(auth) > 7 && auth[:7] == "Bearer " {
+		if isActiveTokenHash(hashTokenSecret(auth[7:])) {
+			return true
+		}
+	}
+
+	// Fall back to session cookie (for browser)
+	c, err := r.Cookie(cookieName)
+	if err == nil {
+		sessionsMu.Lock()
+		s, ok := sessions[c.Value]
+		sessionsMu.Unlock()
+		if ok && !time.Now().After(s.expiresAt) {
+			return true
+		}
+	}
+
+	// API calls without token -> 401
+	// Use HasPrefix to avoid slice bounds panic on short paths
+	path := r.URL.Path
+	if len(path) >= 4 && (path[:4] == "/qr" || path[:4] == "/docs") ||
+		len(path) >= 6 && path[:6] == "/wxapp" ||
+		len(path) >= 9 && path[:9] == "/accounts" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"code":401,"msg":"invalid api token","data":null}`))
+		return false
+	}
+
+	// Browser -> redirect to login
+	http.Redirect(w, r, "/login", http.StatusFound)
+	return false
+}
+
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requireAuth(w, r) {
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		// API clients (no text/html in Accept) get JSON response
+		accept := r.Header.Get("Accept")
+		if !strings.Contains(accept, "text/html") {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"code":0,"msg":"success","data":{"authenticated":true,"ok":true}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		errFlag := "none"
+		if r.URL.Query().Get("err") == "1" {
+			errFlag = "block"
+		}
+		w.Write([]byte(`<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YYB Go - 登录</title>
+<style>
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{display:grid;place-items:center;background:oklch(0.974 0.004 250);font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}
+.card{width:min(380px,calc(100vw-32px));background:white;border:1px solid oklch(0.885 0.012 250);border-radius:12px;padding:32px}
+h1{margin:0 0 24px;font-size:22px;text-align:center}
+label{display:block;margin-bottom:4px;font-size:13px;color:oklch(0.43 0.025 252)}
+input{width:100%;padding:10px 12px;border:1px solid oklch(0.885 0.012 250);border-radius:8px;margin-bottom:16px;outline:none}
+input:focus{border-color:oklch(0.54 0.205 3)}
+button{width:100%;padding:10px;border:0;border-radius:8px;background:oklch(0.54 0.205 3);color:white;font-size:15px}
+button:hover{background:oklch(0.48 0.195 3)}
+.err{color:oklch(0.55 0.18 25);font-size:13px;margin:12px 0 0;text-align:center;display:` + errFlag + `}
+</style>
+<div class="card">
+<h1>YYB Go</h1>
+<form method="post" action="/login">
+<label for="u">用户名</label>
+<input id="u" name="username" required autocomplete="username" autofocus>
+<label for="p">密码</label>
+<input id="p" type="password" name="password" required autocomplete="current-password">
+<button type="submit">登录</button>
+<p class="err">用户名或密码错误</p>
+</form>
+</div>
+</body></html>`))
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	r.ParseForm()
+	u := r.FormValue("username")
+	p := r.FormValue("password")
+
+	if u != adminUser || p != adminPass {
+		http.Redirect(w, r, "/login?err=1", http.StatusFound)
+		return
+	}
+
+	sid := generateSessionID()
+	sessionsMu.Lock()
+	sessions[sid] = sessionEntry{user: u, expiresAt: time.Now().Add(24 * time.Hour)}
+	sessionsMu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    sid,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   86400,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// 删除服务端会话
+	if c, err := r.Cookie(cookieName); err == nil {
+		sessionsMu.Lock()
+		delete(sessions, c.Value)
+		sessionsMu.Unlock()
+	}
+	// 清除浏览器 cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
