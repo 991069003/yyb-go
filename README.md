@@ -16,5 +16,6 @@ https://github.com/991069003/yyb-go/blob/50c7abc5aece4b38bd2cd8a6cbd6e1cc76356ca
 
 ### 已兼容qq-farm-bot项目
 
-- 地址：https://github.com/991069003/qq-farm-bot
+- 原作者地址：https://github.com/xxxscarlxrd404/qq-farm-bot
+- 我的地址：https://github.com/991069003/qq-farm-bot
 - 自行摸索
